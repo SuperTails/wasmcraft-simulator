@@ -1,6 +1,6 @@
 use pixels::Pixels;
 use wasmtime::*;
-use std::{io::Read, sync::Mutex, collections::HashMap};
+use std::{io::Read, sync::Mutex, collections::HashMap, path::PathBuf};
 
 use crate::sdl_system::SDLSystem;
 
@@ -15,6 +15,7 @@ struct McState {
     turtle_z: i32,
     pixels: Pixels,
     blocks: HashMap<(i32, i32, i32), i32>,
+    cfg: Cfg,
 }
 
 impl McState {
@@ -25,7 +26,7 @@ impl McState {
     pub fn set_at(&mut self, block: i32, x: i32, y: i32, z: i32) {
         self.blocks.insert((x, y, z), block);
 
-        if x >= 0 && y >= 0 && z == -60 {
+        if x >= 0 && y >= 0 && z == self.cfg.z_plane {
             let index = 4 * ((500 - x as u32) + (300 - y) as u32 * SCREEN_WIDTH);
 
             let pixel = &mut self.pixels.get_frame()[index as usize..][..4];
@@ -48,37 +49,95 @@ impl McState {
                 _ => pixel.copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]),
             }
         }
-
-        if block == 9 && x == 129 && y == 1 {
-            self.pixels.render().unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
     }
 }
 
-fn main() {
+struct Cfg {
+    quiet_print: bool,
+    quiet_sleep: bool,
+    z_plane: i32,
+    frame_magic: i32,
+    frame_sleep: u64,
+    path: PathBuf,
+}
+
+impl Cfg {
+    pub fn new(args: &[String]) -> Result<Self, ()> {
+        if args.is_empty() {
+            return Err(());
+        }
+
+        let flag_args = &args[..args.len() - 1];
+
+        let mut result = Cfg { quiet_print: false, quiet_sleep: false, z_plane: -60, path: args[args.len() - 1].clone().into(), frame_magic: 0xDDDD, frame_sleep: 500, };
+
+        for flag in flag_args {
+            if flag == "--quiet-print" {
+                result.quiet_print = true;
+            } else if flag == "--quiet-sleep" {
+                result.quiet_sleep = true;
+            } else if let Some(num) = flag.strip_prefix("--z-plane=") {
+                let num = num.parse().map_err(|_| ())?;
+                result.z_plane = num;
+            } else if let Some(num) = flag.strip_prefix("--frame-magic=") {
+                let num = num.parse().map_err(|_| ())?;
+                result.frame_magic = num;
+            } else if let Some(num) = flag.strip_prefix("--frame-sleep=") {
+                let num = num.parse().map_err(|_| ())?;
+                result.frame_sleep = num;
+            } else {
+                return Err(());
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+fn print_usage(binary_name: &str) {
+    println!("Usage: cargo run -- [FLAGS] <WASM FILE>");
+    println!("Usage: {} [FLAGS] <WASM FILE>", binary_name);
+    println!("Runs a WebAssembly file compiled for Wasmcraft and displays the output.");
+    println!();
+    println!("Flags:");
+    println!("--quiet-print       Disables output from `print()` calls");
+    println!("--quiet-sleep       Disables printing a message for `mc_sleep()` calls");
+    println!("--z-plane=NUM       Sets the z coordinate that will be checked for blocks to display (defaults to -60)");
+    println!("--frame-magic=NUM   Sets the magic argument to `print()` that indicates a frame has completed");
+    println!("--frame-sleep=NUM   Specifies how many milliseconds to sleep after a frame finishes (defaults to 500)")
+}
+
+fn main() -> Result<(), i32> {
+    let args = std::env::args().collect::<Vec<String>>();
+
+    let cfg = match Cfg::new(&args[1..]) {
+        Ok(c) => c,
+        Err(()) => {
+            print_usage(&args[0]);
+            return Err(1);
+        }
+    };
+
     let sdl_system = SDLSystem::new();
     let pixels = Pixels::new(SCREEN_WIDTH, SCREEN_HEIGHT, pixels::SurfaceTexture::new(SCREEN_WIDTH, SCREEN_HEIGHT, &sdl_system.window)).unwrap();
 
-    let state = Mutex::new(McState { turtle_x: 0, turtle_y: 0, turtle_z: 0, pixels, blocks: HashMap::new() });
+    let state = Mutex::new(McState { turtle_x: 0, turtle_y: 0, turtle_z: 0, pixels, blocks: HashMap::new(), cfg });
     let state = Box::leak(Box::new(state));
 
     let handle = std::thread::spawn(|| {
-        //let path = "/home/salix/Programming/ccleste/ccleste-mc.wasm";
-        let path = "/home/salix/Programming/doomgeneric/doomgeneric/doomgeneric.wasm";
-        //let path = "/home/salix/Documents/Code/wasmcraft/findplane_test/main.wasm";
-        //let path = "/home/salix/Programming/rusty-nes/mnes_mc/target/wasm32-unknown-unknown/release/mnes_mc.wasm";
-        //let path = "/home/salix/Programming/rusty-nes/mnes_mc/target/wasm32-unknown-unknown/release/mnes_mc.wasm";
-        //let path = "./fib.wasm";
-        //let path = "./fib_rs.wasm";
-
         //let engine = Engine::new(Config::new().debug_info(true)).unwrap();
         let engine = Engine::new(&Config::new()).unwrap();
+
+        let path = {
+            let s = state.lock().unwrap();
+            s.cfg.path.clone()
+        };
 
         let mut file = std::fs::File::open(path).unwrap();
         let mut file_data = Vec::new();
         file.read_to_end(&mut file_data).unwrap();
         let file_data = file_data;
+
 
         let module = Module::new(&engine, &file_data).unwrap();
         println!("Hello, world!");
@@ -110,23 +169,23 @@ fn main() {
             }
         }).unwrap();
         linker.func_wrap("env", "print", |caller: Caller<'_, u32>, param: i32| {
-            //println!("Printed {}", param);
+            let l = state.lock().unwrap();
 
-            let mut l = state.lock().unwrap();
+            if !l.cfg.quiet_print {
+                println!("Printed {}", param);
+            }
 
-            if param == 0xDDDD {
+            if param == l.cfg.frame_magic {
                 l.pixels.render().unwrap();
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                std::thread::sleep(std::time::Duration::from_millis(l.cfg.frame_sleep));
             }
         }).unwrap();
-        /*linker.func_wrap("env", "print", |caller: Caller<'_, u32>, param: i32| {
-            println!("Printing {param}");
-        }).unwrap();
-        linker.func_wrap("env", "sleep", |caller: Caller<'_, u32>| {
-            //println!("Slept");
-        }).unwrap();*/
         linker.func_wrap("env", "mc_sleep", |caller: Caller<'_, u32>| {
-            //println!("Slept");
+            let l = state.lock().unwrap();
+
+            if !l.cfg.quiet_sleep {
+                println!("Slept");
+            }
         }).unwrap();
         linker.func_wrap("env", "turtle_x", |caller: Caller<'_, u32>, param: i32| {
             //println!("Set turtle x to {param}");
